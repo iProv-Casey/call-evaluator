@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+.env
+.env.*
+
+*.log
+
+.venv/
+venv/
+ENV/
+
+.pytest_cache/
+.coverage
+htmlcov/
+
+.DS_Store
+Thumbs.db
+
+.idea/
+.vscode/
+
+Never Came In.csv
