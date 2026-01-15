@@ -1077,16 +1077,16 @@ def run_parse_eval_json(args: argparse.Namespace) -> None:
     if not airtable_base or not airtable_table:
         raise ValueError("Airtable base and table are required (set via flags or client config).")
 
+    output_csv = args.output_csv
+    output_rows: List[Dict[str, object]] = []
+
     # Build a filter formula that can skip already-parsed rows unless forced.
-    if args.force:
+    if args.force or output_csv:
         filter_formula = f"AND({{{args.eval_json_field}}}, LEN({{{args.eval_json_field}}})>0)"
     else:
         filter_formula = (
             f"AND({{{args.eval_json_field}}}, LEN({{{args.eval_json_field}}})>0, NOT({{{args.call_type_field}}}))"
         )
-
-    output_csv = args.output_csv
-    output_rows: List[Dict[str, object]] = []
 
     # Fetch candidate records and parse their evaluation JSON.
     with requests.Session() as session:
@@ -1136,7 +1136,7 @@ def run_parse_eval_json(args: argparse.Namespace) -> None:
 
             if output_csv:
                 row: Dict[str, object] = {"Airtable Record ID": record.get("id")}
-                for field_name in ("Call ID", "Client"):
+                for field_name in ("Call ID", "Client", "Gatekeeper Channel"):
                     if field_name in fields:
                         row[field_name] = fields[field_name]
                 row.update(flatten_json(eval_json))
