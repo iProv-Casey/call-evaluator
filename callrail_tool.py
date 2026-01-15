@@ -26,6 +26,7 @@ class ClientConfig:
     company_id: str
     airtable_base_id: Optional[str] = None
     airtable_table_name: Optional[str] = None
+    prompt_dir: Optional[str] = None
     system_prompt: Optional[str] = None
 
 
@@ -44,6 +45,7 @@ def load_clients(config_path: str) -> List[ClientConfig]:
                     company_id=str(raw["company_id"]),
                     airtable_base_id=raw.get("airtable_base_id"),
                     airtable_table_name=raw.get("airtable_table_name"),
+                    prompt_dir=raw.get("prompt_dir"),
                     system_prompt=raw.get("system_prompt"),
                 )
             )
@@ -387,6 +389,64 @@ def load_prompt(path: str) -> str:
         return fh.read()
 
 
+PROMPT_FILES = {
+    "gatekeeper": "gatekeeper.md",
+    "evaluator": "evaluator.md",
+    "parser": "parser.md",
+}
+
+
+def resolve_prompt_path(client: ClientConfig, config_path: str, prompt_name: str = "evaluator") -> Optional[str]:
+    if not client.prompt_dir:
+        return None
+    config_root = os.path.dirname(os.path.abspath(config_path))
+    prompt_dir = client.prompt_dir
+    if not os.path.isabs(prompt_dir):
+        prompt_dir = os.path.join(config_root, prompt_dir)
+    filename = PROMPT_FILES.get(prompt_name)
+    if not filename:
+        raise ValueError(f"Unknown prompt name '{prompt_name}'. Expected one of: {', '.join(PROMPT_FILES)}.")
+    prompt_path = os.path.join(prompt_dir, filename)
+    if not os.path.exists(prompt_path):
+        raise FileNotFoundError(f"Prompt file not found: {prompt_path}")
+    return prompt_path
+
+
+def parse_gatekeeper_output(raw: object) -> Tuple[str, Optional[str]]:
+    if raw is None:
+        raise ValueError("Gatekeeper output is empty.")
+    if isinstance(raw, dict):
+        payload = raw
+        raw_text = json.dumps(payload, ensure_ascii=False)
+    elif isinstance(raw, str):
+        raw_text = raw.strip()
+        if not raw_text:
+            raise ValueError("Gatekeeper output is empty.")
+        try:
+            payload = json.loads(raw_text)
+        except Exception as exc:
+            raise ValueError(f"Gatekeeper JSON could not be parsed: {exc}")
+    else:
+        raise ValueError(f"Unsupported gatekeeper payload type: {type(raw)}")
+
+    channel = payload.get("channel")
+    if isinstance(channel, str):
+        channel = channel.strip() or None
+    else:
+        channel = None
+    return raw_text, channel
+
+
+def build_eval_input(transcript: str, gatekeeper_json: Optional[str], gatekeeper_channel: Optional[str]) -> str:
+    parts: List[str] = []
+    if gatekeeper_json:
+        parts.append(f"Gatekeeper JSON:\n{gatekeeper_json.strip()}")
+    elif gatekeeper_channel:
+        parts.append(f"Gatekeeper channel: {gatekeeper_channel}")
+    parts.append(f"Transcript:\n{transcript}")
+    return "\n\n".join(parts)
+
+
 def parse_agent_output(text: str) -> Tuple[str, str]:
     json_section = ""
     summary_section = ""
@@ -566,6 +626,27 @@ def parse_eval_json_fields(
     return fields
 
 
+def flatten_json(value: object, prefix: str = "") -> Dict[str, object]:
+    flattened: Dict[str, object] = {}
+
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            key_text = str(key)
+            nested_prefix = f"{prefix}.{key_text}" if prefix else key_text
+            flattened.update(flatten_json(nested, nested_prefix))
+        return flattened
+
+    if isinstance(value, list):
+        if all(isinstance(item, (str, int, float, bool)) or item is None for item in value):
+            flattened[prefix] = ", ".join("" if item is None else str(item) for item in value)
+        else:
+            flattened[prefix] = json.dumps(value, ensure_ascii=False)
+        return flattened
+
+    flattened[prefix] = value
+    return flattened
+
+
 def evaluate_transcript(
     client: OpenAI,
     model: str,
@@ -742,6 +823,114 @@ def run_csv_pipeline(args: argparse.Namespace) -> None:
             print(f"Upserted Airtable record {record_id} for call {call_id}.")
 
 
+def run_classify_airtable(args: argparse.Namespace) -> None:
+    # Load client configurations and resolve the target client.
+    clients = load_clients(args.config)
+    selected_client = select_client(clients, args.client)
+    # Limit record count in test mode to keep runs fast.
+    max_records = 5 if args.test else None
+
+    # Read Airtable credentials and target metadata.
+    airtable_api_key = os.getenv("AIRTABLE_API_KEY")
+    if not airtable_api_key:
+        raise EnvironmentError("AIRTABLE_API_KEY is required.")
+    airtable_base = args.airtable_base or selected_client.airtable_base_id
+    airtable_table = args.airtable_table or selected_client.airtable_table_name
+    if not airtable_base or not airtable_table:
+        raise ValueError("Airtable base and table are required (set via flags or client config).")
+
+    # Read OpenAI credentials and create the API client.
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if not openai_key:
+        raise EnvironmentError("OPENAI_API_KEY is required.")
+    openai_client = OpenAI(api_key=openai_key)
+
+    # Resolve the gatekeeper prompt from CLI override or client config.
+    prompt = None
+    if args.prompt_file:
+        prompt = load_prompt(args.prompt_file)
+    else:
+        prompt_path = resolve_prompt_path(selected_client, args.config, prompt_name="gatekeeper")
+        if prompt_path:
+            prompt = load_prompt(prompt_path)
+    if not prompt:
+        raise ValueError("Gatekeeper prompt is required. Add prompt_dir to the client config or provide --prompt-file.")
+
+    # Build an Airtable filter formula that skips already-classified rows unless forced.
+    if not args.force:
+        filter_formula = (
+            f"AND({{{args.transcript_field}}}, LEN({{{args.transcript_field}}})>0, "
+            f"NOT({{{args.json_field}}}))"
+        )
+    else:
+        filter_formula = f"AND({{{args.transcript_field}}}, LEN({{{args.transcript_field}}})>0)"
+
+    # Fetch candidate records and classify them one by one.
+    with requests.Session() as session:
+        records = fetch_airtable_records(
+            session,
+            airtable_api_key=airtable_api_key,
+            base_id=airtable_base,
+            table_name=airtable_table,
+            filter_formula=filter_formula,
+            max_records=max_records,
+        )
+        total = len(records)
+        if total == 0:
+            print("No Airtable records found matching filter.")
+            return
+
+        for idx, record in enumerate(records, start=1):
+            fields = record.get("fields", {})
+            transcript = fields.get(args.transcript_field)
+            if not transcript:
+                print(f"[{idx}/{total}] Skipping record {record.get('id')}: missing transcript field.")
+                continue
+
+            print(f"[{idx}/{total}] Classifying record {record.get('id')}...")
+            try:
+                json_text, _ = evaluate_transcript(
+                    openai_client,
+                    model=args.model,
+                    prompt=prompt,
+                    transcript=transcript,
+                )
+            except Exception as exc:
+                print(f"Failed to classify record {record.get('id')}: {exc}")
+                continue
+
+            try:
+                gatekeeper_json, gatekeeper_channel = parse_gatekeeper_output(json_text)
+            except Exception as exc:
+                print(f"Failed to parse gatekeeper JSON for record {record.get('id')}: {exc}")
+                continue
+
+            update_fields: Dict[str, object] = {
+                args.json_field: gatekeeper_json,
+            }
+            if gatekeeper_channel and args.channel_field:
+                update_fields[args.channel_field] = gatekeeper_channel
+            if args.timestamp_field:
+                update_fields[args.timestamp_field] = dt.datetime.now(dt.timezone.utc).isoformat()
+
+            if args.dry_run:
+                print(f"Dry run: would update {record.get('id')} with {update_fields}")
+                continue
+
+            try:
+                update_airtable_record_fields(
+                    session,
+                    airtable_api_key=airtable_api_key,
+                    base_id=airtable_base,
+                    table_name=airtable_table,
+                    record_id=record["id"],
+                    fields=update_fields,
+                )
+                print(f"Updated record {record.get('id')} with gatekeeper classification.")
+            except Exception as exc:
+                print(f"Failed to update Airtable for record {record.get('id')}: {exc}")
+
+
 def run_eval_airtable(args: argparse.Namespace) -> None:
     # Load client configurations and resolve the target client.
     clients = load_clients(args.config)
@@ -765,18 +954,28 @@ def run_eval_airtable(args: argparse.Namespace) -> None:
         raise EnvironmentError("OPENAI_API_KEY is required.")
     openai_client = OpenAI(api_key=openai_key)
 
-    # Resolve the system prompt from client config or a prompt file.
-    prompt = selected_client.system_prompt
-    if not prompt and args.prompt_file:
+    # Resolve the system prompt from CLI override or client config.
+    prompt = None
+    if args.prompt_file:
         prompt = load_prompt(args.prompt_file)
+    elif selected_client.system_prompt:
+        prompt = selected_client.system_prompt
+    else:
+        prompt_path = resolve_prompt_path(selected_client, args.config, prompt_name="evaluator")
+        if prompt_path:
+            prompt = load_prompt(prompt_path)
     if not prompt:
         raise ValueError(
-            "System prompt is required. Add system_prompt to the client config or provide --prompt-file."
+            "System prompt is required. Add prompt_dir to the client config or provide --prompt-file."
         )
     # Build an Airtable filter formula that skips already-evaluated rows unless forced.
     filter_formula = None
     if not args.force:
-        filter_formula = f"AND({{{args.transcript_field}}}, LEN({{{args.transcript_field}}})>0, NOT({{{args.json_field}}}))"
+        filter_formula = (
+            f"AND({{{args.transcript_field}}}, LEN({{{args.transcript_field}}})>0, "
+            f"{{{args.gatekeeper_json_field}}}, LEN({{{args.gatekeeper_json_field}}})>0, "
+            f"NOT({{{args.json_field}}}))"
+        )
     else:
         filter_formula = f"AND({{{args.transcript_field}}}, LEN({{{args.transcript_field}}})>0)"
 
@@ -802,15 +1001,31 @@ def run_eval_airtable(args: argparse.Namespace) -> None:
             if not transcript:
                 print(f"[{idx}/{total}] Skipping record {record.get('id')}: missing transcript field.")
                 continue
+            gatekeeper_raw = fields.get(args.gatekeeper_json_field) if args.gatekeeper_json_field else None
+            gatekeeper_channel = fields.get(args.gatekeeper_channel_field) if args.gatekeeper_channel_field else None
+            if not gatekeeper_raw and not gatekeeper_channel:
+                print(f"[{idx}/{total}] Skipping record {record.get('id')}: missing gatekeeper output.")
+                continue
+
+            gatekeeper_json = None
+            if gatekeeper_raw:
+                try:
+                    gatekeeper_json, parsed_channel = parse_gatekeeper_output(gatekeeper_raw)
+                    if not gatekeeper_channel:
+                        gatekeeper_channel = parsed_channel
+                except Exception as exc:
+                    print(f"[{idx}/{total}] Skipping record {record.get('id')}: gatekeeper JSON invalid ({exc})")
+                    continue
 
             # Send the transcript to OpenAI for evaluation.
             print(f"[{idx}/{total}] Evaluating record {record.get('id')}...")
             try:
+                eval_input = build_eval_input(transcript, gatekeeper_json, gatekeeper_channel)
                 json_text, summary_text = evaluate_transcript(
                     openai_client,
                     model=args.model,
                     prompt=prompt,
-                    transcript=transcript,
+                    transcript=eval_input,
                 )
             except Exception as exc:
                 print(f"Failed to evaluate record {record.get('id')}: {exc}")
@@ -870,6 +1085,9 @@ def run_parse_eval_json(args: argparse.Namespace) -> None:
             f"AND({{{args.eval_json_field}}}, LEN({{{args.eval_json_field}}})>0, NOT({{{args.call_type_field}}}))"
         )
 
+    output_csv = args.output_csv
+    output_rows: List[Dict[str, object]] = []
+
     # Fetch candidate records and parse their evaluation JSON.
     with requests.Session() as session:
         existing_fields = fetch_airtable_table_fields(
@@ -916,6 +1134,15 @@ def run_parse_eval_json(args: argparse.Namespace) -> None:
                 print(f"Failed to parse JSON for record {record.get('id')}: expected object, got {type(eval_json)}")
                 continue
 
+            if output_csv:
+                row: Dict[str, object] = {"Airtable Record ID": record.get("id")}
+                for field_name in ("Call ID", "Client"):
+                    if field_name in fields:
+                        row[field_name] = fields[field_name]
+                row.update(flatten_json(eval_json))
+                output_rows.append(row)
+                continue
+
             # Map the evaluation JSON into Airtable field updates.
             update_fields = parse_eval_json_fields(
                 eval_json,
@@ -956,6 +1183,23 @@ def run_parse_eval_json(args: argparse.Namespace) -> None:
             except Exception as exc:
                 print(f"Failed to update Airtable for record {record.get('id')}: {exc}")
 
+    if output_csv:
+        if not output_rows:
+            print("No rows available to write to CSV.")
+            return
+        output_keys = []
+        seen = set()
+        for row in output_rows:
+            for key in row.keys():
+                if key not in seen:
+                    output_keys.append(key)
+                    seen.add(key)
+        with open(output_csv, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=output_keys, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(output_rows)
+        print(f"Wrote {len(output_rows)} rows to {output_csv}.")
+
 
 def run_check_airtable_schema(args: argparse.Namespace) -> None:
     clients = load_clients(args.config)
@@ -969,6 +1213,15 @@ def run_check_airtable_schema(args: argparse.Namespace) -> None:
     airtable_table = args.airtable_table or selected_client.airtable_table_name
     if not airtable_base or not airtable_table:
         raise ValueError("Airtable base and table are required (set via flags or client config).")
+
+    classify_fields = [
+        args.transcript_field,
+        args.gatekeeper_json_field,
+    ]
+    if args.gatekeeper_channel_field:
+        classify_fields.append(args.gatekeeper_channel_field)
+    if args.gatekeeper_timestamp_field:
+        classify_fields.append(args.gatekeeper_timestamp_field)
 
     eval_fields = [
         args.transcript_field,
@@ -995,10 +1248,12 @@ def run_check_airtable_schema(args: argparse.Namespace) -> None:
     ]
 
     mode = args.mode.lower()
-    if mode not in ("eval", "parse", "all"):
-        raise ValueError("Mode must be one of: eval, parse, all.")
+    if mode not in ("classify", "eval", "parse", "all"):
+        raise ValueError("Mode must be one of: classify, eval, parse, all.")
 
     expected_fields = []
+    if mode in ("classify", "all"):
+        expected_fields.extend(classify_fields)
     if mode in ("eval", "all"):
         expected_fields.extend(eval_fields)
     if mode in ("parse", "all"):
@@ -1064,8 +1319,54 @@ def parse_args() -> argparse.Namespace:
     run_csv_parser.add_argument("--dry-run", action="store_true", help="Skip Airtable writes.")
     run_csv_parser.add_argument("--test", action="store_true", help="Process only 5 rows (useful for validation).")
 
+    classify_parser = subparsers.add_parser(
+        "classify-airtable", help="Classify transcripts as live/voicemail using the gatekeeper prompt."
+    )
+    classify_parser.add_argument("--client", required=True, help="Client name from config.")
+    classify_parser.add_argument("--config", default="clients.yaml", help="Path to clients config.")
+    classify_parser.add_argument("--airtable-base", help="Override Airtable base ID.")
+    classify_parser.add_argument("--airtable-table", help="Override Airtable table name.")
+    classify_parser.add_argument(
+        "--prompt-file",
+        default=None,
+        help="Override gatekeeper prompt from clients config by pointing to a prompt file.",
+    )
+    classify_parser.add_argument(
+        "--transcript-field",
+        default="Transcript",
+        help="Airtable field containing the call transcript.",
+    )
+    classify_parser.add_argument(
+        "--json-field",
+        default="Gatekeeper JSON",
+        help="Airtable field to store the gatekeeper JSON output.",
+    )
+    classify_parser.add_argument(
+        "--channel-field",
+        default="Gatekeeper Channel",
+        help="Airtable field to store the gatekeeper channel (single select).",
+    )
+    classify_parser.add_argument(
+        "--timestamp-field",
+        default="Gatekeeper Timestamp",
+        help="Airtable field to store the gatekeeper timestamp (set blank to skip).",
+    )
+    classify_parser.add_argument(
+        "--model",
+        default="gpt-4o-mini",
+        help="OpenAI model for classification.",
+    )
+    classify_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Process even if json-field already populated.",
+    )
+    classify_parser.add_argument("--dry-run", action="store_true", help="Skip Airtable writes.")
+    classify_parser.add_argument("--test", action="store_true", help="Process only 5 records (useful for validation).")
+
     eval_parser = subparsers.add_parser(
-        "eval-airtable", help="Evaluate transcripts already stored in Airtable using the client's system prompt."
+        "eval-airtable",
+        help="Evaluate transcripts already stored in Airtable using the client's system prompt (requires gatekeeper).",
     )
     eval_parser.add_argument("--client", required=True, help="Client name from config.")
     eval_parser.add_argument("--config", default="clients.yaml", help="Path to clients config.")
@@ -1090,6 +1391,16 @@ def parse_args() -> argparse.Namespace:
         "--summary-field",
         default="Evaluation Summary",
         help="Airtable field to store the executive summary markdown.",
+    )
+    eval_parser.add_argument(
+        "--gatekeeper-json-field",
+        default="Gatekeeper JSON",
+        help="Airtable field containing gatekeeper JSON output.",
+    )
+    eval_parser.add_argument(
+        "--gatekeeper-channel-field",
+        default="Gatekeeper Channel",
+        help="Airtable field containing gatekeeper channel.",
     )
     eval_parser.add_argument(
         "--timestamp-field",
@@ -1124,6 +1435,11 @@ def parse_args() -> argparse.Namespace:
         "--eval-json-field",
         default="Evaluation JSON",
         help="Airtable field containing evaluation JSON text.",
+    )
+    parse_parser.add_argument(
+        "--output-csv",
+        default=None,
+        help="Write flattened evaluation JSON to a CSV file instead of updating Airtable.",
     )
     parse_parser.add_argument(
         "--call-type-field",
@@ -1195,7 +1511,7 @@ def parse_args() -> argparse.Namespace:
 
     schema_parser = subparsers.add_parser(
         "check-airtable-schema",
-        help="Check Airtable table for required evaluation/parse fields.",
+        help="Check Airtable table for required classify/eval/parse fields.",
     )
     schema_parser.add_argument("--client", required=True, help="Client name from config.")
     schema_parser.add_argument("--config", default="clients.yaml", help="Path to clients config.")
@@ -1204,12 +1520,27 @@ def parse_args() -> argparse.Namespace:
     schema_parser.add_argument(
         "--mode",
         default="all",
-        help="Fields to validate: eval, parse, or all (default).",
+        help="Fields to validate: classify, eval, parse, or all (default).",
     )
     schema_parser.add_argument(
         "--transcript-field",
         default="Transcript",
         help="Airtable field containing the call transcript.",
+    )
+    schema_parser.add_argument(
+        "--gatekeeper-json-field",
+        default="Gatekeeper JSON",
+        help="Airtable field containing gatekeeper JSON output.",
+    )
+    schema_parser.add_argument(
+        "--gatekeeper-channel-field",
+        default="Gatekeeper Channel",
+        help="Airtable field to store gatekeeper channel (single select).",
+    )
+    schema_parser.add_argument(
+        "--gatekeeper-timestamp-field",
+        default="Gatekeeper Timestamp",
+        help="Airtable field to store the gatekeeper timestamp (set blank to skip).",
     )
     schema_parser.add_argument(
         "--json-field",
@@ -1307,6 +1638,9 @@ def main() -> None:
         return
     if args.command == "run-csv":
         run_csv_pipeline(args)
+        return
+    if args.command == "classify-airtable":
+        run_classify_airtable(args)
         return
     if args.command == "eval-airtable":
         run_eval_airtable(args)

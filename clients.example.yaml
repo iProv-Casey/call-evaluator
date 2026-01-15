@@ -5,7 +5,6 @@ clients:
     # Optional: per-client Airtable overrides (fallback to env/default flags)
     airtable_base_id: "appXXXXXXXXXXXXXX"
     airtable_table_name: "Call Transcripts"
-    # Required for eval-airtable: per-client agent system prompt.
-    system_prompt: |
-      # Replace this with the agent system prompt you want to use for this client.
-      # Markdown is fine. Keep the content indented at least two spaces.
+    # Required for eval-airtable: per-client agent prompt directory.
+    # Expected files: gatekeeper.md, evaluator.md, parser.md
+    prompt_dir: "agents/ExampleClient"
