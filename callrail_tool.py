@@ -322,7 +322,37 @@ def update_airtable_record_fields(
     # Send the partial update with the provided field payload.
     resp = session.patch(url, headers=headers, json={"fields": fields})
     # Raise an exception for non-2xx responses.
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        raise RuntimeError(f"Airtable update failed ({resp.status_code}): {resp.text}") from exc
+
+
+def fetch_airtable_table_fields(
+    session: requests.Session,
+    airtable_api_key: str,
+    base_id: str,
+    table_name: str,
+) -> Dict[str, str]:
+    url = f"https://api.airtable.com/v0/meta/bases/{base_id}/tables"
+    headers = {"Authorization": f"Bearer {airtable_api_key}"}
+    response = request_with_retry(session, "GET", url, headers=headers)
+    data = response.json()
+    tables = data.get("tables", [])
+    target = None
+    for table in tables:
+        if table.get("name") == table_name or table.get("id") == table_name:
+            target = table
+            break
+    if not target:
+        available = ", ".join(sorted(table.get("name", "") for table in tables if table.get("name")))
+        raise ValueError(f"Airtable table '{table_name}' not found. Available tables: {available}")
+    fields: Dict[str, str] = {}
+    for field in target.get("fields", []):
+        name = field.get("name")
+        if name:
+            fields[name] = field.get("type", "")
+    return fields
 
 
 def parse_dates(start_date: str, end_date: str) -> (str, str):
@@ -398,35 +428,140 @@ def parse_eval_json_fields(
     converted_field: str,
     primary_issue_field: str,
     overall_score_field: str,
+    scheduling_efficiency_field: str,
+    appointment_explicitly_offered_field: str,
+    estimated_revenue_lost_range_field: str,
+    estimated_revenue_lost_rationale_field: str,
+    failure_mode_tags_field: str,
+    strategic_quadrant_field: str,
+    confidence_in_assessment_field: str,
 ) -> Dict[str, object]:
+    def as_dict(value: object) -> Dict[str, object]:
+        return value if isinstance(value, dict) else {}
+
+    def normalize_select_value(value: object) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float, str)):
+            text = str(value).strip()
+            return text if text else None
+        return None
+
+    def normalize_text(value: object) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value.strip() or None
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        return None
+
+    def normalize_bool(value: object) -> Optional[bool]:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in ("true", "yes", "y", "1"):
+                return True
+            if text in ("false", "no", "n", "0"):
+                return False
+        return None
+
+    def normalize_multi_select(value: object) -> Optional[List[str]]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            raw = [item.strip() for item in value.split(",")]
+            values = [item for item in raw if item]
+            return values or None
+        if isinstance(value, list):
+            values: List[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    stripped = item.strip()
+                    if stripped:
+                        values.append(stripped)
+            return values or None
+        return None
+
     fields: Dict[str, object] = {}
-    call_type = eval_json.get("call_type")
+    call_type = normalize_select_value(eval_json.get("call_type") or eval_json.get("call_classification"))
     if call_type:
         fields[call_type_field] = call_type
 
-    lead_quality = (eval_json.get("lead_quality") or {}).get("rating")
+    lead_quality = normalize_select_value(
+        as_dict(eval_json.get("lead_quality")).get("rating") or eval_json.get("lead_quality")
+    )
     if lead_quality:
         fields[lead_quality_field] = lead_quality
 
-    outcome = (eval_json.get("outcome") or {})
+    outcome = as_dict(eval_json.get("outcome"))
     converted_raw = outcome.get("converted")
-    if converted_raw is None or converted_raw == "":
-        converted_value = "not_applicable"
-    else:
-        converted_value = str(converted_raw)
-    fields[converted_field] = converted_value
+    if converted_raw is None:
+        converted_raw = eval_json.get("converted")
+    converted_value = normalize_select_value(converted_raw)
+    fields[converted_field] = converted_value or "not_applicable"
 
-    primary_issue = (eval_json.get("root_cause") or {}).get("primary_issue")
+    primary_issue = normalize_select_value(
+        as_dict(eval_json.get("root_cause")).get("primary_issue") or eval_json.get("root_cause_issue")
+    )
     if primary_issue:
         fields[primary_issue_field] = primary_issue
 
-    scores = (eval_json.get("scores") or {})
+    scores = as_dict(eval_json.get("scores") or eval_json.get("scoring"))
     overall = scores.get("overall_score")
     if overall not in (None, ""):
         try:
             fields[overall_score_field] = float(overall)
         except Exception:
             pass
+
+    scheduling_efficiency = scores.get("scheduling_efficiency") or scores.get("scheduling_efficiency_score")
+    if scheduling_efficiency not in (None, ""):
+        try:
+            fields[scheduling_efficiency_field] = float(scheduling_efficiency)
+        except Exception:
+            pass
+
+    appointment_offer_raw = outcome.get("appointment_explicitly_offered")
+    if appointment_offer_raw is None:
+        appointment_offer_raw = eval_json.get("appointment_explicitly_offered")
+    if appointment_offer_raw is not None:
+        appointment_explicitly_offered = normalize_bool(appointment_offer_raw)
+        if appointment_explicitly_offered is not None:
+            fields[appointment_explicitly_offered_field] = appointment_explicitly_offered
+
+    estimated_revenue_lost = as_dict(eval_json.get("estimated_revenue_lost"))
+    revenue_range = normalize_select_value(estimated_revenue_lost.get("range"))
+    if revenue_range not in (None, ""):
+        fields[estimated_revenue_lost_range_field] = revenue_range
+    revenue_rationale = normalize_text(estimated_revenue_lost.get("rationale"))
+    if revenue_rationale not in (None, ""):
+        fields[estimated_revenue_lost_rationale_field] = revenue_rationale
+
+    failure_mode_tags = eval_json.get("failure_mode_tags")
+    if not failure_mode_tags:
+        failure_mode_tags = as_dict(eval_json.get("root_cause")).get("failure_mode_tags")
+    normalized_tags = normalize_multi_select(failure_mode_tags)
+    if normalized_tags:
+        fields[failure_mode_tags_field] = normalized_tags
+
+    strategic_quadrant = (
+        eval_json.get("strategic_quadrant")
+        or eval_json.get("strategic_quadrant_classification")
+        or eval_json.get("quadrant_classification")
+    )
+    strategic_quadrant_value = normalize_select_value(strategic_quadrant)
+    if strategic_quadrant_value:
+        fields[strategic_quadrant_field] = strategic_quadrant_value
+
+    confidence_in_assessment = normalize_select_value(eval_json.get("confidence_in_assessment"))
+    if confidence_in_assessment:
+        fields[confidence_in_assessment_field] = confidence_in_assessment
 
     return fields
 
@@ -711,18 +846,23 @@ def run_eval_airtable(args: argparse.Namespace) -> None:
 
 
 def run_parse_eval_json(args: argparse.Namespace) -> None:
+    # Load client configs and resolve the target client.
     clients = load_clients(args.config)
     selected_client = select_client(clients, args.client)
+    # Limit record count in test mode to keep runs fast.
     max_records = 5 if args.test else None
 
+    # Read Airtable credentials and target metadata.
     airtable_api_key = os.getenv("AIRTABLE_API_KEY")
     if not airtable_api_key:
         raise EnvironmentError("AIRTABLE_API_KEY is required.")
+    # Allow CLI flags to override client defaults for base/table.
     airtable_base = args.airtable_base or selected_client.airtable_base_id
     airtable_table = args.airtable_table or selected_client.airtable_table_name
     if not airtable_base or not airtable_table:
         raise ValueError("Airtable base and table are required (set via flags or client config).")
 
+    # Build a filter formula that can skip already-parsed rows unless forced.
     if args.force:
         filter_formula = f"AND({{{args.eval_json_field}}}, LEN({{{args.eval_json_field}}})>0)"
     else:
@@ -730,7 +870,14 @@ def run_parse_eval_json(args: argparse.Namespace) -> None:
             f"AND({{{args.eval_json_field}}}, LEN({{{args.eval_json_field}}})>0, NOT({{{args.call_type_field}}}))"
         )
 
+    # Fetch candidate records and parse their evaluation JSON.
     with requests.Session() as session:
+        existing_fields = fetch_airtable_table_fields(
+            session,
+            airtable_api_key=airtable_api_key,
+            base_id=airtable_base,
+            table_name=airtable_table,
+        )
         records = fetch_airtable_records(
             session,
             airtable_api_key=airtable_api_key,
@@ -745,19 +892,31 @@ def run_parse_eval_json(args: argparse.Namespace) -> None:
             return
 
         for idx, record in enumerate(records, start=1):
+            # Pull the evaluation JSON text from the record payload.
             fields = record.get("fields", {})
             eval_json_str = fields.get(args.eval_json_field)
             if not eval_json_str:
                 print(f"[{idx}/{total}] Skipping record {record.get('id')}: missing eval JSON.")
                 continue
 
+            # Parse the JSON payload (handle nested JSON strings when present).
             print(f"[{idx}/{total}] Parsing evaluation for record {record.get('id')}...")
             try:
                 eval_json = json.loads(eval_json_str)
             except Exception as exc:
                 print(f"Failed to parse JSON for record {record.get('id')}: {exc}")
                 continue
+            if isinstance(eval_json, str):
+                try:
+                    eval_json = json.loads(eval_json)
+                except Exception as exc:
+                    print(f"Failed to parse nested JSON for record {record.get('id')}: {exc}")
+                    continue
+            if not isinstance(eval_json, dict):
+                print(f"Failed to parse JSON for record {record.get('id')}: expected object, got {type(eval_json)}")
+                continue
 
+            # Map the evaluation JSON into Airtable field updates.
             update_fields = parse_eval_json_fields(
                 eval_json,
                 call_type_field=args.call_type_field,
@@ -765,12 +924,25 @@ def run_parse_eval_json(args: argparse.Namespace) -> None:
                 converted_field=args.converted_field,
                 primary_issue_field=args.primary_issue_field,
                 overall_score_field=args.overall_score_field,
+                scheduling_efficiency_field=args.scheduling_efficiency_field,
+                appointment_explicitly_offered_field=args.appointment_explicitly_offered_field,
+                estimated_revenue_lost_range_field=args.estimated_revenue_lost_range_field,
+                estimated_revenue_lost_rationale_field=args.estimated_revenue_lost_rationale_field,
+                failure_mode_tags_field=args.failure_mode_tags_field,
+                strategic_quadrant_field=args.strategic_quadrant_field,
+                confidence_in_assessment_field=args.confidence_in_assessment_field,
             )
+            update_fields = {key: value for key, value in update_fields.items() if key in existing_fields}
+            if not update_fields:
+                print(f"[{idx}/{total}] Skipping record {record.get('id')}: no matching Airtable fields found.")
+                continue
 
+            # Skip writes in dry-run mode.
             if args.dry_run:
                 print(f"Dry run: would update {record.get('id')} with {update_fields}")
                 continue
 
+            # Persist parsed fields back to Airtable.
             try:
                 update_airtable_record_fields(
                     session,
@@ -783,6 +955,75 @@ def run_parse_eval_json(args: argparse.Namespace) -> None:
                 print(f"Updated record {record.get('id')} with parsed evaluation fields.")
             except Exception as exc:
                 print(f"Failed to update Airtable for record {record.get('id')}: {exc}")
+
+
+def run_check_airtable_schema(args: argparse.Namespace) -> None:
+    clients = load_clients(args.config)
+    selected_client = select_client(clients, args.client)
+
+    airtable_api_key = os.getenv("AIRTABLE_API_KEY")
+    if not airtable_api_key:
+        raise EnvironmentError("AIRTABLE_API_KEY is required.")
+
+    airtable_base = args.airtable_base or selected_client.airtable_base_id
+    airtable_table = args.airtable_table or selected_client.airtable_table_name
+    if not airtable_base or not airtable_table:
+        raise ValueError("Airtable base and table are required (set via flags or client config).")
+
+    eval_fields = [
+        args.transcript_field,
+        args.json_field,
+        args.summary_field,
+    ]
+    if args.timestamp_field:
+        eval_fields.append(args.timestamp_field)
+
+    parse_fields = [
+        args.eval_json_field,
+        args.call_type_field,
+        args.lead_quality_field,
+        args.converted_field,
+        args.primary_issue_field,
+        args.overall_score_field,
+        args.scheduling_efficiency_field,
+        args.appointment_explicitly_offered_field,
+        args.estimated_revenue_lost_range_field,
+        args.estimated_revenue_lost_rationale_field,
+        args.failure_mode_tags_field,
+        args.strategic_quadrant_field,
+        args.confidence_in_assessment_field,
+    ]
+
+    mode = args.mode.lower()
+    if mode not in ("eval", "parse", "all"):
+        raise ValueError("Mode must be one of: eval, parse, all.")
+
+    expected_fields = []
+    if mode in ("eval", "all"):
+        expected_fields.extend(eval_fields)
+    if mode in ("parse", "all"):
+        expected_fields.extend(parse_fields)
+
+    expected_fields = [field for field in expected_fields if field]
+    expected_unique = sorted({field.strip() for field in expected_fields if field.strip()})
+
+    with requests.Session() as session:
+        existing_fields = fetch_airtable_table_fields(
+            session,
+            airtable_api_key=airtable_api_key,
+            base_id=airtable_base,
+            table_name=airtable_table,
+        )
+
+    missing = [field for field in expected_unique if field not in existing_fields]
+
+    print(f"Checked Airtable schema for table '{airtable_table}' ({mode}).")
+    if missing:
+        print("Missing fields:")
+        for field in missing:
+            print(f"- {field}")
+    else:
+        print("All expected fields are present.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -870,7 +1111,10 @@ def parse_args() -> argparse.Namespace:
 
     parse_parser = subparsers.add_parser(
         "parse-eval-json",
-        help="Parse Evaluation JSON field into typed Airtable columns (call type, lead quality, converted, primary issue, overall score).",
+        help=(
+            "Parse Evaluation JSON field into typed Airtable columns (call type, lead quality, converted, "
+            "primary issue, overall score, and v2 evaluation fields)."
+        ),
     )
     parse_parser.add_argument("--client", required=True, help="Client name from config.")
     parse_parser.add_argument("--config", default="clients.yaml", help="Path to clients config.")
@@ -883,8 +1127,8 @@ def parse_args() -> argparse.Namespace:
     )
     parse_parser.add_argument(
         "--call-type-field",
-        default="Call Type",
-        help="Airtable field to store call type (single select).",
+        default="Call Classification",
+        help="Airtable field to store call classification (single select).",
     )
     parse_parser.add_argument(
         "--lead-quality-field",
@@ -907,12 +1151,146 @@ def parse_args() -> argparse.Namespace:
         help="Airtable field to store overall score (number).",
     )
     parse_parser.add_argument(
+        "--scheduling-efficiency-field",
+        default="Scheduling Efficiency",
+        help="Airtable field to store scheduling efficiency score (number).",
+    )
+    parse_parser.add_argument(
+        "--appointment-explicitly-offered-field",
+        default="Appointment Explicitly Offered",
+        help="Airtable field to store appointment explicitly offered (checkbox).",
+    )
+    parse_parser.add_argument(
+        "--estimated-revenue-lost-range-field",
+        default="Estimated Revenue Lost Range",
+        help="Airtable field to store estimated revenue lost range (single select).",
+    )
+    parse_parser.add_argument(
+        "--estimated-revenue-lost-rationale-field",
+        default="Estimated Revenue Lost Rationale",
+        help="Airtable field to store estimated revenue lost rationale (long text).",
+    )
+    parse_parser.add_argument(
+        "--failure-mode-tags-field",
+        default="Failure Mode Tags",
+        help="Airtable field to store failure mode tags (multi-select).",
+    )
+    parse_parser.add_argument(
+        "--strategic-quadrant-field",
+        default="Strategic Quadrant",
+        help="Airtable field to store strategic quadrant classification (single select).",
+    )
+    parse_parser.add_argument(
+        "--confidence-in-assessment-field",
+        default="Confidence In Assessment",
+        help="Airtable field to store confidence indicator (single select).",
+    )
+    parse_parser.add_argument(
         "--force",
         action="store_true",
         help="Process even if destination fields are already populated.",
     )
     parse_parser.add_argument("--dry-run", action="store_true", help="Skip Airtable writes.")
     parse_parser.add_argument("--test", action="store_true", help="Process only 5 records (useful for validation).")
+
+    schema_parser = subparsers.add_parser(
+        "check-airtable-schema",
+        help="Check Airtable table for required evaluation/parse fields.",
+    )
+    schema_parser.add_argument("--client", required=True, help="Client name from config.")
+    schema_parser.add_argument("--config", default="clients.yaml", help="Path to clients config.")
+    schema_parser.add_argument("--airtable-base", help="Override Airtable base ID.")
+    schema_parser.add_argument("--airtable-table", help="Override Airtable table name.")
+    schema_parser.add_argument(
+        "--mode",
+        default="all",
+        help="Fields to validate: eval, parse, or all (default).",
+    )
+    schema_parser.add_argument(
+        "--transcript-field",
+        default="Transcript",
+        help="Airtable field containing the call transcript.",
+    )
+    schema_parser.add_argument(
+        "--json-field",
+        default="Evaluation JSON",
+        help="Airtable field to store the JSON output from the agent.",
+    )
+    schema_parser.add_argument(
+        "--summary-field",
+        default="Evaluation Summary",
+        help="Airtable field to store the executive summary markdown.",
+    )
+    schema_parser.add_argument(
+        "--timestamp-field",
+        default="Evaluation Timestamp",
+        help="Airtable field to store the evaluation timestamp (set blank to skip).",
+    )
+    schema_parser.add_argument(
+        "--eval-json-field",
+        default="Evaluation JSON",
+        help="Airtable field containing evaluation JSON text.",
+    )
+    schema_parser.add_argument(
+        "--call-type-field",
+        default="Call Classification",
+        help="Airtable field to store call classification (single select).",
+    )
+    schema_parser.add_argument(
+        "--lead-quality-field",
+        default="Lead Quality Rating",
+        help="Airtable field to store lead quality rating (single select).",
+    )
+    schema_parser.add_argument(
+        "--converted-field",
+        default="Converted",
+        help="Airtable field to store converted status (single select).",
+    )
+    schema_parser.add_argument(
+        "--primary-issue-field",
+        default="Primary Issue",
+        help="Airtable field to store primary issue (single select).",
+    )
+    schema_parser.add_argument(
+        "--overall-score-field",
+        default="Overall Score",
+        help="Airtable field to store overall score (number).",
+    )
+    schema_parser.add_argument(
+        "--scheduling-efficiency-field",
+        default="Scheduling Efficiency",
+        help="Airtable field to store scheduling efficiency score (number).",
+    )
+    schema_parser.add_argument(
+        "--appointment-explicitly-offered-field",
+        default="Appointment Explicitly Offered",
+        help="Airtable field to store appointment explicitly offered (checkbox).",
+    )
+    schema_parser.add_argument(
+        "--estimated-revenue-lost-range-field",
+        default="Estimated Revenue Lost Range",
+        help="Airtable field to store estimated revenue lost range (single select).",
+    )
+    schema_parser.add_argument(
+        "--estimated-revenue-lost-rationale-field",
+        default="Estimated Revenue Lost Rationale",
+        help="Airtable field to store estimated revenue lost rationale (long text).",
+    )
+    schema_parser.add_argument(
+        "--failure-mode-tags-field",
+        default="Failure Mode Tags",
+        help="Airtable field to store failure mode tags (multi-select).",
+    )
+    schema_parser.add_argument(
+        "--strategic-quadrant-field",
+        default="Strategic Quadrant",
+        help="Airtable field to store strategic quadrant classification (single select).",
+    )
+    schema_parser.add_argument(
+        "--confidence-in-assessment-field",
+        default="Confidence In Assessment",
+        help="Airtable field to store confidence indicator (single select).",
+    )
 
     return parser.parse_args()
 
@@ -935,6 +1313,9 @@ def main() -> None:
         return
     if args.command == "parse-eval-json":
         run_parse_eval_json(args)
+        return
+    if args.command == "check-airtable-schema":
+        run_check_airtable_schema(args)
         return
     raise ValueError(f"Unknown command {args.command}")
 

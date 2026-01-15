@@ -78,6 +78,12 @@ Choose **exactly one**:
 
 If classification cannot be determined, select `unclear` and explain why.
 
+#### Voicemail Identification (Authoritative)
+
+If the transcript contains the following voicemail text (or a clear paraphrase), classify as a voicemail call with certainty. Because callers can press a number mid-message, a partial excerpt is sufficient as long as it unambiguously matches this voicemail:
+
+> Thank you for calling Smile Daily Dental. We are unable to come to the phone right now. If this call is during business hours, we apologize for missing your call and will get back to you as soon as we can. If this call is after hours and you are a new patient, please press 1. If this call is after hours and you are an existing patient with an emergency dental pain, please press 2. Thank you for calling Smile Daily Dental. Our office hours are Monday and Thursday, 8 a.m. to 4.30 p.m., Tuesday and Wednesday, 7 a.m. to 3.30 p.m., and Friday, 7 a.m. to 2 p.m. If you have reached this message during normal business hours, we are either helping another patient or have stepped away for lunch. Please leave your full name, best contact phone number, and your date of birth. One of our Smile Daily team members will return your call as soon as possible. Please note, all messages will be returned same day unless they are left after 3 p.m. Thank you and have a great day.
+
 ---
 
 ### Phase 2 – Secondary Attributes (Non-Scoring Metadata)
