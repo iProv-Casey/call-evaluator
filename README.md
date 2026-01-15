@@ -44,6 +44,17 @@ Create a table with fields: `Client` (single line), `Call ID` (single line, make
 - Keep `clients.yaml` prompts in sync by running: `python3 scripts/sync_client_prompt.py --client "Client Name" --prompt-file path/to/prompt.md` (repeat per client as needed).
 - Long-running jobs stop if you close the terminal; use `nohup` or `tmux` if you need them to keep running after disconnect.
 
+## Making Commits (GitHub)
+Use these steps to commit your changes and push them to GitHub.
+
+1) Check the working tree: `git status`.
+2) Review what changed: `git diff` (or `git diff --staged` after staging).
+3) Stage the files you want: `git add README.md` (or `git add -A` to stage everything).
+4) Commit with a clear message: `git commit -m "Add README commit steps"`.
+5) Pull remote updates (optional but recommended): `git pull --rebase`.
+6) Push to GitHub: `git push`.
+
+# Running On Mac in VS Code
 
 # Running On Mac in VS Code
 
