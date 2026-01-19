@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: callrail-recording-downloader
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -c "import time; time.sleep(10**9)"
+    envVars:
+      - key: CALLRAIL_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: AIRTABLE_API_KEY
+        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "1"
