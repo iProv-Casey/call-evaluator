@@ -56,6 +56,23 @@ Create a table with fields: `Client` (single line), `Call ID` (single line, make
 - Set the prompt location per client in `clients.yaml` using `prompt_dir` (or override with `--prompt-file` at runtime).
 - Long-running jobs stop if you close the terminal; use `nohup` or `tmux` if you need them to keep running after disconnect.
 
+## Remote Runs on Render
+This repo includes a small HTTP runner so you can launch `callrail_tool.py` remotely without keeping a terminal session open.
+
+1) Set `REMOTE_RUNNER_TOKEN` in Render (required).
+2) Deploy the service (Render uses `render.yaml`).
+3) Trigger a job from anywhere:
+
+```
+curl -X POST https://<your-service>.onrender.com/run \
+  -H "Authorization: Bearer <REMOTE_RUNNER_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"args":["run","--client","Client Name","--start-date","2024-01-01","--end-date","2024-01-31"]}'
+```
+
+The response includes the PID and a log path like `logs/run_YYYYMMDD_HHMMSS_xxxxxxxx.log`.
+You can `scp` the log file from Render using the SCP instructions below.
+
 ## Downloading Files From Render (SCP)
 From your local machine (not inside the Render shell), use `scp` with your service host.
 

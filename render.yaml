@@ -1,9 +1,9 @@
 services:
-  - type: worker
+  - type: web
     name: callrail-recording-downloader
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python -c "import time; time.sleep(10**9)"
+    startCommand: python remote_runner.py
     envVars:
       - key: CALLRAIL_API_KEY
         sync: false
@@ -11,5 +11,9 @@ services:
         sync: false
       - key: AIRTABLE_API_KEY
         sync: false
+      - key: REMOTE_RUNNER_TOKEN
+        sync: false
+      - key: REMOTE_RUNNER_LOG_DIR
+        value: "logs"
       - key: PYTHONUNBUFFERED
         value: "1"
