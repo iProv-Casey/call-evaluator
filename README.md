@@ -21,6 +21,12 @@ General-purpose CallRail call transcription and client feedback tool. It pulls r
 - Copy `clients.example.yaml` to `clients.yaml` and add one entry per client (CallRail `account_id` and `company_id`). Optional per-client Airtable overrides are supported. Point `prompt_dir` at each client's prompts so evaluation runs with that client's instructions.
 - Install deps: `python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`.
 
+## Airtable setup
+- Create a base and a table for CallRail calls. Note the base ID and table name for `.env` or `clients.yaml`.
+- Add the core fields: `Client` (single line), `Call ID` (single line, unique), `Call Started At` (date/time), `Caller Number`, `Tracking Number`, `Duration (s)`, `Recording URL`, `Transcript` (long text).
+- If you will use `classify-airtable`/`eval-airtable`/`parse-eval-json`, add: `Gatekeeper JSON`, `Gatekeeper Channel`, `Gatekeeper Timestamp`, `Evaluation JSON`, `Evaluation Summary`, `Evaluation Timestamp` (optional), plus the parse fields in the schema suggestion below.
+- Field names must match or you need to override them with the CLI flags; use `python callrail_tool.py check-airtable-schema --client "Client Name"` to verify.
+
 ## Usage
 - List configured clients: `python callrail_tool.py list-clients`.
 - Run for a client and date range: `python callrail_tool.py run --client "Client Name" --start-date 2024-01-01 --end-date 2024-01-31`.
@@ -49,6 +55,25 @@ Create a table with fields: `Client` (single line), `Call ID` (single line, make
 - To rerun evaluations or parsing and overwrite existing data, use `--force`.
 - Set the prompt location per client in `clients.yaml` using `prompt_dir` (or override with `--prompt-file` at runtime).
 - Long-running jobs stop if you close the terminal; use `nohup` or `tmux` if you need them to keep running after disconnect.
+
+## Downloading Files From Render (SCP)
+From your local machine (not inside the Render shell), use `scp` with your service host.
+
+Template:
+```
+scp <service>@ssh.oregon.render.com:/opt/render/project/src/<filename> <local-destination>
+```
+
+Example:
+```
+scp srv-xxxxxxxxxxxxxxxx@ssh.oregon.render.com:/opt/render/project/src/dec_sdd_eval_export.csv .
+```
+
+If you see a host key warning, refresh the key and retry:
+```
+ssh-keygen -R ssh.oregon.render.com
+ssh-keyscan ssh.oregon.render.com >> ~/.ssh/known_hosts
+```
 
 ## Making Commits (GitHub)
 Use these steps to commit your changes and push them to GitHub.
