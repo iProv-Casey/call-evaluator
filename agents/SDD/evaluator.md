@@ -69,7 +69,7 @@ Do not output this confirmation.
 
 ---
 
-## Call Classification
+## Call Type (Required JSON Key: `call_type`)
 
 Choose **exactly one**:
 
@@ -82,6 +82,40 @@ Choose **exactly one**:
 * `unclear`
 
 Classification must align with Step 1 channel output.
+
+In the JSON output, this must be provided under the key `call_type` (never `call_classification`).
+
+Example:
+
+```json
+"call_type": "new_patient_live"
+```
+
+---
+
+## JSON Schema (Must Match Exactly)
+
+You must output a single JSON object with the following keys, in this order:
+
+```json
+{
+  "call_type": "",
+  "call_outcome": {
+    "status": "success | failure | neutral",
+    "definition_used": "appointment_booked | qualified_lead_not_converted | wrong_number | admin_call | voicemail_only | unclear",
+    "rationale": ""
+  },
+  "wrong_number_or_misdial": true,
+  "confidence_in_assessment": "high | medium | low"
+}
+```
+
+Notes:
+
+* `call_type` must be one of the allowed call types listed above.
+* `wrong_number_or_misdial` is required and must be a boolean.
+* If any field cannot be determined, use `null` and explain in `call_outcome.rationale`.
+* No additional keys are allowed in the JSON output.
 
 ---
 
