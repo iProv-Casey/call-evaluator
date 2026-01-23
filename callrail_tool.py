@@ -189,6 +189,18 @@ def download_recording_with_fallback(
 ) -> bytes:
     errors: List[str] = []
 
+    def _try_fetch_audio(url: str, headers: Optional[Dict[str, str]]) -> Optional[bytes]:
+        response = session.get(url, headers=headers or {}, timeout=60, allow_redirects=True, stream=True)
+        if response.status_code == 401:
+            errors.append(f"401 from {url} (auth={'yes' if headers else 'no'}) body={response.text[:200]}")
+            return None
+        response.raise_for_status()
+        ct = response.headers.get("Content-Type", "")
+        if not _is_audio_content(ct):
+            errors.append(f"Non-audio from {url} (content-type={ct}) sample={response.text[:200]}")
+            return None
+        return response.content
+
     def try_download(url: str, headers: Optional[Dict[str, str]]) -> Optional[bytes]:
         try:
             response = session.get(url, headers=headers or {}, timeout=60, allow_redirects=True, stream=True)
@@ -197,6 +209,18 @@ def download_recording_with_fallback(
                 return None
             response.raise_for_status()
             ct = response.headers.get("Content-Type", "")
+            if "application/json" in ct:
+                data = response.json()
+                signed_url = data.get("url") or data.get("recording_url")
+                if not signed_url:
+                    errors.append(f"JSON without audio url from {url}: {data}")
+                    return None
+                audio = _try_fetch_audio(signed_url, None)
+                if audio:
+                    return audio
+                if headers:
+                    return _try_fetch_audio(signed_url, headers)
+                return None
             if not _is_audio_content(ct):
                 errors.append(f"Non-audio from {url} (content-type={ct}) sample={response.text[:200]}")
                 return None
